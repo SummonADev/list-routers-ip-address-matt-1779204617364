@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Router } from '@/types';
+import { Router, Neighbor, NDPState } from '@/types';
 import styles from '@/components/topology/TopologyDiagram.module.css';
 import { routerStatusColor } from '@/lib/utils';
-import { Server, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
+import { Server, ZoomIn, ZoomOut, Maximize2, RefreshCw } from 'lucide-react';
 
 type Props = {
   routers: Router[];
   onUpdateRouter?: (id: string, data: Partial<Omit<Router, 'id' | 'neighbors'>>) => void;
+  onUpdateNeighbor?: (routerId: string, neighborId: string, data: Partial<Omit<Neighbor, 'id' | 'routerId'>>) => void;
 };
 
 type NodePos = {
@@ -19,7 +20,9 @@ type Edge = {
   sourceId: string;
   targetId: string;
   cost: number;
-  state: string;
+  state: NDPState;
+  neighborId: string; // which neighbor entry owns this edge (source side)
+  sourceRouterId: string;
 };
 
 type InlineEdit = {
@@ -28,9 +31,30 @@ type InlineEdit = {
   value: string;
 } | null;
 
+type EdgeEdit = {
+  edgeKey: string;
+  field: 'cost' | 'state';
+  value: string;
+  neighborId: string;
+  sourceRouterId: string;
+} | null;
+
+type EdgePopup = {
+  edgeKey: string;
+  x: number;
+  y: number;
+  neighborId: string;
+  sourceRouterId: string;
+  cost: number;
+  state: NDPState;
+} | null;
+
 const NODE_W = 160;
 const NODE_H = 86;
 const PADDING = 80;
+
+const NDP_STATES: NDPState[] = ['REACHABLE', 'STALE', 'DELAY', 'PROBE', 'INCOMPLETE'];
+const STATUS_OPTIONS: Router['status'][] = ['online', 'offline', 'degraded'];
 
 function getEdgeColor(state: string): string {
   switch (state) {
@@ -144,21 +168,25 @@ function buildEdges(routers: Router[]): Edge[] {
         targetId: n.adjacentRouterId,
         cost: n.cost ?? 10,
         state: n.state,
+        neighborId: n.id,
+        sourceRouterId: r.id,
       });
     });
   });
   return edges;
 }
 
-const STATUS_OPTIONS: Router['status'][] = ['online', 'offline', 'degraded'];
-
-function statusVariantColor(status: Router['status']): string {
-  if (status === 'online') return '#34d399';
-  if (status === 'degraded') return '#fbbf24';
-  return '#f87171';
+function randomStatus(): Router['status'] {
+  const statuses: Router['status'][] = ['online', 'online', 'online', 'degraded', 'offline'];
+  return statuses[Math.floor(Math.random() * statuses.length)];
 }
 
-export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
+function randomNDPState(): NDPState {
+  const states: NDPState[] = ['REACHABLE', 'REACHABLE', 'REACHABLE', 'STALE', 'DELAY', 'PROBE', 'INCOMPLETE'];
+  return states[Math.floor(Math.random() * states.length)];
+}
+
+export default function TopologyDiagram({ routers, onUpdateRouter, onUpdateNeighbor }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState({ width: 900, height: 600 });
   const [positions, setPositions] = useState<NodePos[]>([]);
@@ -172,8 +200,13 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
   const [tooltip, setTooltip] = useState<{ x: number; y: number; content: string } | null>(null);
   const [inlineEdit, setInlineEdit] = useState<InlineEdit>(null);
   const [editPopup, setEditPopup] = useState<{ routerId: string; x: number; y: number } | null>(null);
+  const [edgeEdit, setEdgeEdit] = useState<EdgeEdit>(null);
+  const [edgePopup, setEdgePopup] = useState<EdgePopup>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const selectRef = useRef<HTMLSelectElement>(null);
+  const edgeInputRef = useRef<HTMLInputElement>(null);
+  const edgeSelectRef = useRef<HTMLSelectElement>(null);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -191,7 +224,6 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
     setEdges(buildEdges(routers));
   }, [routers, dims]);
 
-  // Focus input/select when inline edit opens
   useEffect(() => {
     if (inlineEdit?.field === 'status') {
       selectRef.current?.focus();
@@ -200,6 +232,15 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
       inputRef.current?.select();
     }
   }, [inlineEdit]);
+
+  useEffect(() => {
+    if (edgeEdit?.field === 'state') {
+      edgeSelectRef.current?.focus();
+    } else if (edgeEdit?.field === 'cost') {
+      edgeInputRef.current?.focus();
+      edgeInputRef.current?.select();
+    }
+  }, [edgeEdit]);
 
   const getPos = useCallback((id: string) => positions.find(p => p.id === id), [positions]);
 
@@ -218,8 +259,29 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
     setEditPopup(null);
   }, []);
 
+  const commitEdgeEdit = useCallback(() => {
+    if (!edgeEdit || !onUpdateNeighbor) { setEdgeEdit(null); return; }
+    const val = edgeEdit.value.trim();
+    if (val) {
+      if (edgeEdit.field === 'cost') {
+        const parsed = parseInt(val, 10);
+        if (!isNaN(parsed) && parsed > 0) {
+          onUpdateNeighbor(edgeEdit.sourceRouterId, edgeEdit.neighborId, { cost: parsed });
+        }
+      } else {
+        onUpdateNeighbor(edgeEdit.sourceRouterId, edgeEdit.neighborId, { state: val as NDPState });
+      }
+    }
+    setEdgeEdit(null);
+  }, [edgeEdit, onUpdateNeighbor]);
+
+  const cancelEdgeEdit = useCallback(() => {
+    setEdgeEdit(null);
+  }, []);
+
   const openEditPopup = (routerId: string, nodeScreenX: number, nodeScreenY: number) => {
     setEditPopup({ routerId, x: nodeScreenX, y: nodeScreenY });
+    setEdgePopup(null);
     setTooltip(null);
     setHoveredNode(null);
   };
@@ -228,9 +290,56 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
     setInlineEdit({ routerId, field, value: currentValue });
   };
 
+  const openEdgePopup = (edge: Edge, screenX: number, screenY: number) => {
+    const key = [edge.sourceId, edge.targetId].sort().join('--');
+    setEdgePopup({
+      edgeKey: key,
+      x: screenX,
+      y: screenY,
+      neighborId: edge.neighborId,
+      sourceRouterId: edge.sourceRouterId,
+      cost: edge.cost,
+      state: edge.state,
+    });
+    setEditPopup(null);
+    setTooltip(null);
+    setEdgeEdit(null);
+  };
+
+  const startEdgeEdit = (field: 'cost' | 'state', currentValue: string) => {
+    if (!edgePopup) return;
+    setEdgeEdit({
+      edgeKey: edgePopup.edgeKey,
+      field,
+      value: currentValue,
+      neighborId: edgePopup.neighborId,
+      sourceRouterId: edgePopup.sourceRouterId,
+    });
+  };
+
+  const handleForceRefresh = useCallback(() => {
+    if (!onUpdateRouter || !onUpdateNeighbor) return;
+    setRefreshing(true);
+
+    routers.forEach(router => {
+      onUpdateRouter(router.id, { status: randomStatus() });
+      router.neighbors.forEach(neighbor => {
+        if (neighbor.adjacentRouterId) {
+          onUpdateNeighbor(router.id, neighbor.id, {
+            state: randomNDPState(),
+            lastSeen: new Date().toISOString(),
+          });
+        }
+      });
+    });
+
+    setTimeout(() => setRefreshing(false), 800);
+  }, [routers, onUpdateRouter, onUpdateNeighbor]);
+
   const onMouseDown = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('[data-node]')) return;
-    if (editPopup) { setEditPopup(null); setInlineEdit(null); return; }
+    if (editPopup) { setEditPopup(null); setInlineEdit(null); }
+    if (edgePopup) { setEdgePopup(null); setEdgeEdit(null); }
     setDragging(true);
     setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
   };
@@ -247,13 +356,10 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
 
   const resetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
 
-  // Convert SVG coords to screen coords for popup positioning
-  const svgToScreen = (svgX: number, svgY: number) => {
-    return {
-      x: svgX * zoom + pan.x,
-      y: svgY * zoom + pan.y,
-    };
-  };
+  const svgToScreen = (svgX: number, svgY: number) => ({
+    x: svgX * zoom + pan.x,
+    y: svgY * zoom + pan.y,
+  });
 
   return (
     <div className={styles.wrapper}>
@@ -268,8 +374,23 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
         <button className={styles.ctrlBtn} onClick={resetView} title="Reset view">
           <Maximize2 size={16} />
         </button>
+
+        <div className={styles.controlsDivider} />
+
+        {(onUpdateRouter && onUpdateNeighbor) && (
+          <button
+            className={`${styles.refreshBtn} ${refreshing ? styles.refreshBtnSpin : ''}`}
+            onClick={handleForceRefresh}
+            disabled={refreshing}
+            title="Force refresh all router and link statuses"
+          >
+            <RefreshCw size={14} className={refreshing ? styles.spinIcon : ''} />
+            <span>{refreshing ? 'Refreshing…' : 'Force Status Refresh'}</span>
+          </button>
+        )}
+
         {onUpdateRouter && (
-          <span className={styles.editHint}>Click a node to edit IP / status</span>
+          <span className={styles.editHint}>Click a node or link to edit</span>
         )}
       </div>
 
@@ -283,11 +404,7 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
         onMouseLeave={onMouseUp}
         onWheel={onWheel}
       >
-        <svg
-          width={dims.width}
-          height={dims.height}
-          className={styles.svg}
-        >
+        <svg width={dims.width} height={dims.height} className={styles.svg}>
           <defs>
             {['REACHABLE','STALE','DELAY','PROBE','INCOMPLETE'].map(state => (
               <marker
@@ -319,6 +436,7 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
               if (!src || !tgt) return null;
               const edgeKey = [edge.sourceId, edge.targetId].sort().join('--');
               const isHovered = hoveredEdge === edgeKey;
+              const isEdgePopupOpen = edgePopup?.edgeKey === edgeKey;
               const midX = (src.x + tgt.x) / 2;
               const midY = (src.y + tgt.y) / 2;
               const color = getEdgeColor(edge.state);
@@ -338,52 +456,83 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
               const y2 = tgt.y - uy * tScale;
 
               return (
-                <g key={edgeKey}
+                <g
+                  key={edgeKey}
+                  style={{ cursor: onUpdateNeighbor ? 'pointer' : 'default' }}
                   onMouseEnter={e => {
                     setHoveredEdge(edgeKey);
-                    const rect = containerRef.current?.getBoundingClientRect();
-                    if (rect) setTooltip({
-                      x: e.clientX - rect.left,
-                      y: e.clientY - rect.top,
-                      content: `Cost: ${edge.cost} | State: ${edge.state}`,
-                    });
+                    if (!edgePopup) {
+                      const rect = containerRef.current?.getBoundingClientRect();
+                      if (rect) setTooltip({
+                        x: e.clientX - rect.left,
+                        y: e.clientY - rect.top,
+                        content: `Cost: ${edge.cost} | State: ${edge.state}\nClick to edit`,
+                      });
+                    }
                   }}
                   onMouseLeave={() => { setHoveredEdge(null); setTooltip(null); }}
+                  onClick={e => {
+                    if (!onUpdateNeighbor) return;
+                    e.stopPropagation();
+                    const rect = containerRef.current?.getBoundingClientRect();
+                    if (!rect) return;
+                    openEdgePopup(edge, e.clientX - rect.left, e.clientY - rect.top);
+                  }}
                 >
-                  <line
-                    x1={x1} y1={y1} x2={x2} y2={y2}
-                    stroke="transparent"
-                    strokeWidth={14}
-                    style={{ cursor: 'pointer' }}
-                  />
+                  {/* Wide transparent hit area */}
+                  <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="transparent" strokeWidth={18} />
                   <line
                     x1={x1} y1={y1} x2={x2} y2={y2}
                     stroke={color}
-                    strokeWidth={isHovered ? 3 : 1.5}
+                    strokeWidth={isHovered || isEdgePopupOpen ? 3 : 1.5}
                     strokeDasharray={dash}
-                    opacity={isHovered ? 1 : 0.65}
-                    filter={isHovered ? 'url(#glow)' : undefined}
+                    opacity={isHovered || isEdgePopupOpen ? 1 : 0.65}
+                    filter={isHovered || isEdgePopupOpen ? 'url(#glow)' : undefined}
                     markerEnd={`url(#arrow-${edge.state})`}
                   />
+                  {/* Cost badge */}
                   <rect
-                    x={midX - 16} y={midY - 10}
-                    width={32} height={18}
-                    rx={4}
+                    x={midX - 18} y={midY - 11}
+                    width={36} height={22}
+                    rx={5}
                     fill="#1a1d27"
-                    stroke={color}
-                    strokeWidth={0.8}
-                    opacity={0.9}
+                    stroke={isEdgePopupOpen ? '#60a5fa' : color}
+                    strokeWidth={isEdgePopupOpen ? 1.5 : 0.8}
+                    opacity={0.95}
                   />
                   <text
-                    x={midX} y={midY + 4}
+                    x={midX} y={midY - 1}
                     textAnchor="middle"
                     fill={color}
                     fontSize={10}
                     fontFamily="var(--font-mono)"
-                    fontWeight={600}
+                    fontWeight={700}
                   >
                     {edge.cost}
                   </text>
+                  <text
+                    x={midX} y={midY + 9}
+                    textAnchor="middle"
+                    fill={color}
+                    fontSize={7}
+                    fontFamily="var(--font-mono)"
+                    opacity={0.75}
+                  >
+                    {edge.state.slice(0, 4)}
+                  </text>
+                  {/* Edit hint on hover */}
+                  {isHovered && !isEdgePopupOpen && onUpdateNeighbor && (
+                    <text
+                      x={midX} y={midY - 16}
+                      textAnchor="middle"
+                      fill="#60a5fa"
+                      fontSize={7.5}
+                      fontFamily="var(--font-sans)"
+                      fontStyle="italic"
+                    >
+                      click to edit
+                    </text>
+                  )}
                 </g>
               );
             })}
@@ -405,7 +554,7 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
                   transform={`translate(${x},${y})`}
                   style={{ cursor: onUpdateRouter ? 'pointer' : 'default' }}
                   onMouseEnter={e => {
-                    if (editPopup) return;
+                    if (editPopup || edgePopup) return;
                     setHoveredNode(router.id);
                     const rect = containerRef.current?.getBoundingClientRect();
                     if (rect) setTooltip({
@@ -421,7 +570,6 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
                     openEditPopup(router.id, screen.x, screen.y);
                   }}
                 >
-                  {/* Glow ring when hovered or being edited */}
                   {(isHovered || isEditTarget) && (
                     <rect
                       x={-4} y={-4}
@@ -434,8 +582,6 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
                       filter="url(#glow)"
                     />
                   )}
-
-                  {/* Node body */}
                   <rect
                     x={0} y={0}
                     width={NODE_W} height={NODE_H}
@@ -444,85 +590,23 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
                     stroke={isEditTarget ? '#60a5fa' : statusColor}
                     strokeWidth={isHovered || isEditTarget ? 2 : 1.5}
                   />
-
-                  {/* Status bar */}
-                  <rect
-                    x={0} y={0}
-                    width={4} height={NODE_H}
-                    rx={2}
-                    fill={statusColor}
-                  />
-
-                  {/* Icon background */}
-                  <rect
-                    x={12} y={14}
-                    width={28} height={28}
-                    rx={6}
-                    fill={statusColor}
-                    opacity={0.15}
-                  />
-
-                  {/* Icon */}
-                  <text
-                    x={26} y={33}
-                    textAnchor="middle"
-                    fontSize={16}
-                    fill={statusColor}
-                  >
-                    ⬡
-                  </text>
-
-                  {/* Router name */}
-                  <text
-                    x={50} y={24}
-                    fill="#e2e8f0"
-                    fontSize={11}
-                    fontWeight={700}
-                    fontFamily="var(--font-sans)"
-                  >
+                  <rect x={0} y={0} width={4} height={NODE_H} rx={2} fill={statusColor} />
+                  <rect x={12} y={14} width={28} height={28} rx={6} fill={statusColor} opacity={0.15} />
+                  <text x={26} y={33} textAnchor="middle" fontSize={16} fill={statusColor}>⬡</text>
+                  <text x={50} y={24} fill="#e2e8f0" fontSize={11} fontWeight={700} fontFamily="var(--font-sans)">
                     {router.name.length > 16 ? router.name.slice(0, 15) + '…' : router.name}
                   </text>
-
-                  {/* IPv4 */}
-                  <text
-                    x={50} y={39}
-                    fill="#8892a4"
-                    fontSize={9.5}
-                    fontFamily="var(--font-mono)"
-                  >
+                  <text x={50} y={39} fill="#8892a4" fontSize={9.5} fontFamily="var(--font-mono)">
                     {router.ipv4Address}
                   </text>
-
-                  {/* IPv6 */}
-                  <text
-                    x={50} y={53}
-                    fill="#6370a4"
-                    fontSize={9}
-                    fontFamily="var(--font-mono)"
-                  >
+                  <text x={50} y={53} fill="#6370a4" fontSize={9} fontFamily="var(--font-mono)">
                     {router.ipv6Address.length > 18 ? router.ipv6Address.slice(0, 17) + '…' : router.ipv6Address}
                   </text>
-
-                  {/* Neighbor count + status badge */}
-                  <text
-                    x={50} y={68}
-                    fill="#4a5070"
-                    fontSize={9}
-                    fontFamily="var(--font-sans)"
-                  >
+                  <text x={50} y={68} fill="#4a5070" fontSize={9} fontFamily="var(--font-sans)">
                     {router.neighbors.length} neighbor{router.neighbors.length !== 1 ? 's' : ''}
                   </text>
-
-                  {/* Edit hint */}
                   {onUpdateRouter && isHovered && !isEditTarget && (
-                    <text
-                      x={NODE_W - 8} y={14}
-                      textAnchor="end"
-                      fill="#60a5fa"
-                      fontSize={8.5}
-                      fontFamily="var(--font-sans)"
-                      fontStyle="italic"
-                    >
+                    <text x={NODE_W - 8} y={14} textAnchor="end" fill="#60a5fa" fontSize={8.5} fontFamily="var(--font-sans)" fontStyle="italic">
                       click to edit
                     </text>
                   )}
@@ -533,11 +617,8 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
         </svg>
 
         {/* Tooltip */}
-        {tooltip && !editPopup && (
-          <div
-            className={styles.tooltip}
-            style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}
-          >
+        {tooltip && !editPopup && !edgePopup && (
+          <div className={styles.tooltip} style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}>
             {tooltip.content.split('\n').map((line, i) => (
               <div key={i} style={{ opacity: i === 0 ? 1 : 0.75, fontSize: i === 0 ? '0.82rem' : '0.75rem' }}>
                 {line}
@@ -546,18 +627,14 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
           </div>
         )}
 
-        {/* Inline Edit Popup */}
+        {/* Node Edit Popup */}
         {editPopup && onUpdateRouter && (() => {
           const router = routers.find(r => r.id === editPopup.routerId);
           if (!router) return null;
           const statusColor = routerStatusColor(router.status);
-          // Position popup centered above the node
           const popupW = 230;
-          const popupLeft = Math.min(
-            Math.max(editPopup.x - popupW / 2, 8),
-            dims.width - popupW - 8
-          );
-          const popupTop = Math.max(editPopup.y - NODE_H * zoom / 2 - 180, 8);
+          const popupLeft = Math.min(Math.max(editPopup.x - popupW / 2, 8), dims.width - popupW - 8);
+          const popupTop = Math.max(editPopup.y - NODE_H * zoom / 2 - 200, 8);
 
           return (
             <div
@@ -588,11 +665,7 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
                     <button className={styles.editCancelBtn} onClick={() => setInlineEdit(null)}>✕</button>
                   </div>
                 ) : (
-                  <div
-                    className={styles.editValueRow}
-                    onClick={() => startInlineEdit(router.id, 'ipv4Address', router.ipv4Address)}
-                    title="Click to edit"
-                  >
+                  <div className={styles.editValueRow} onClick={() => startInlineEdit(router.id, 'ipv4Address', router.ipv4Address)} title="Click to edit">
                     <code className={styles.editValueCode}>{router.ipv4Address}</code>
                     <span className={styles.editPencil}>✎</span>
                   </div>
@@ -616,11 +689,7 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
                     <button className={styles.editCancelBtn} onClick={() => setInlineEdit(null)}>✕</button>
                   </div>
                 ) : (
-                  <div
-                    className={styles.editValueRow}
-                    onClick={() => startInlineEdit(router.id, 'ipv6Address', router.ipv6Address)}
-                    title="Click to edit"
-                  >
+                  <div className={styles.editValueRow} onClick={() => startInlineEdit(router.id, 'ipv6Address', router.ipv6Address)} title="Click to edit">
                     <code className={styles.editValueCode}>{router.ipv6Address}</code>
                     <span className={styles.editPencil}>✎</span>
                   </div>
@@ -647,11 +716,7 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
                     <button className={styles.editCancelBtn} onClick={() => setInlineEdit(null)}>✕</button>
                   </div>
                 ) : (
-                  <div
-                    className={styles.editValueRow}
-                    onClick={() => startInlineEdit(router.id, 'status', router.status)}
-                    title="Click to edit"
-                  >
+                  <div className={styles.editValueRow} onClick={() => startInlineEdit(router.id, 'status', router.status)} title="Click to edit">
                     <span className={styles.editStatusDot} style={{ background: statusColor }} />
                     <span className={styles.editStatusText} style={{ color: statusColor }}>
                       {router.status.charAt(0).toUpperCase() + router.status.slice(1)}
@@ -662,6 +727,98 @@ export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
               </div>
 
               <button className={styles.editPopupDone} onClick={cancelEdit}>Done</button>
+            </div>
+          );
+        })()}
+
+        {/* Edge Edit Popup */}
+        {edgePopup && onUpdateNeighbor && (() => {
+          const edge = edges.find(e => [e.sourceId, e.targetId].sort().join('--') === edgePopup.edgeKey);
+          if (!edge) return null;
+          const color = getEdgeColor(edgePopup.state);
+          const popupW = 220;
+          const popupLeft = Math.min(Math.max(edgePopup.x - popupW / 2, 8), dims.width - popupW - 8);
+          const popupTop = Math.min(Math.max(edgePopup.y - 160, 8), dims.height - 180);
+          const srcRouter = routers.find(r => r.id === edge.sourceId);
+          const tgtRouter = routers.find(r => r.id === edge.targetId);
+
+          return (
+            <div
+              className={styles.editPopup}
+              style={{ left: popupLeft, top: popupTop, width: popupW }}
+              data-node
+              onClick={e => e.stopPropagation()}
+            >
+              <div className={styles.editPopupHeader}>
+                <span className={styles.editPopupTitle} style={{ fontSize: '0.78rem' }}>
+                  {srcRouter?.name ?? edge.sourceId}
+                  <span style={{ color: 'var(--color-text-muted)', margin: '0 4px' }}>↔</span>
+                  {tgtRouter?.name ?? edge.targetId}
+                </span>
+                <button className={styles.editPopupClose} onClick={() => { setEdgePopup(null); setEdgeEdit(null); }}>✕</button>
+              </div>
+
+              <div className={styles.edgeBadgeRow}>
+                <span className={styles.edgeBadge} style={{ borderColor: color, color }}>
+                  {edgePopup.state}
+                </span>
+              </div>
+
+              {/* Cost */}
+              <div className={styles.editPopupField}>
+                <label className={styles.editPopupLabel}>Link Cost</label>
+                {edgeEdit?.edgeKey === edgePopup.edgeKey && edgeEdit.field === 'cost' ? (
+                  <div className={styles.editInputRow}>
+                    <input
+                      ref={edgeInputRef}
+                      className={styles.editInput}
+                      type="number"
+                      min={1}
+                      value={edgeEdit.value}
+                      onChange={e => setEdgeEdit(prev => prev ? { ...prev, value: e.target.value } : null)}
+                      onKeyDown={e => { if (e.key === 'Enter') commitEdgeEdit(); if (e.key === 'Escape') cancelEdgeEdit(); }}
+                      placeholder="e.g. 10"
+                    />
+                    <button className={styles.editSaveBtn} onClick={commitEdgeEdit}>✓</button>
+                    <button className={styles.editCancelBtn} onClick={cancelEdgeEdit}>✕</button>
+                  </div>
+                ) : (
+                  <div className={styles.editValueRow} onClick={() => startEdgeEdit('cost', String(edgePopup.cost))} title="Click to edit">
+                    <code className={styles.editValueCode}>{edgePopup.cost}</code>
+                    <span className={styles.editPencil}>✎</span>
+                  </div>
+                )}
+              </div>
+
+              {/* State */}
+              <div className={styles.editPopupField}>
+                <label className={styles.editPopupLabel}>Link State (NDP)</label>
+                {edgeEdit?.edgeKey === edgePopup.edgeKey && edgeEdit.field === 'state' ? (
+                  <div className={styles.editInputRow}>
+                    <select
+                      ref={edgeSelectRef}
+                      className={styles.editSelect}
+                      value={edgeEdit.value}
+                      onChange={e => setEdgeEdit(prev => prev ? { ...prev, value: e.target.value } : null)}
+                      onKeyDown={e => { if (e.key === 'Escape') cancelEdgeEdit(); }}
+                    >
+                      {NDP_STATES.map(s => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                    <button className={styles.editSaveBtn} onClick={commitEdgeEdit}>✓</button>
+                    <button className={styles.editCancelBtn} onClick={cancelEdgeEdit}>✕</button>
+                  </div>
+                ) : (
+                  <div className={styles.editValueRow} onClick={() => startEdgeEdit('state', edgePopup.state)} title="Click to edit">
+                    <span className={styles.editStatusDot} style={{ background: color }} />
+                    <span className={styles.editStatusText} style={{ color, fontSize: '0.8rem' }}>{edgePopup.state}</span>
+                    <span className={styles.editPencil}>✎</span>
+                  </div>
+                )}
+              </div>
+
+              <button className={styles.editPopupDone} onClick={() => { setEdgePopup(null); setEdgeEdit(null); }}>Done</button>
             </div>
           );
         })()}
