@@ -6,6 +6,7 @@ import { Server, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
 
 type Props = {
   routers: Router[];
+  onUpdateRouter?: (id: string, data: Partial<Omit<Router, 'id' | 'neighbors'>>) => void;
 };
 
 type NodePos = {
@@ -21,8 +22,14 @@ type Edge = {
   state: string;
 };
 
+type InlineEdit = {
+  routerId: string;
+  field: 'ipv4Address' | 'ipv6Address' | 'status';
+  value: string;
+} | null;
+
 const NODE_W = 160;
-const NODE_H = 72;
+const NODE_H = 86;
 const PADDING = 80;
 
 function getEdgeColor(state: string): string {
@@ -46,25 +53,12 @@ function getEdgeDash(state: string): string {
   }
 }
 
-// Force-directed layout seeded by cost
 function computeLayout(routers: Router[], width: number, height: number): NodePos[] {
   if (routers.length === 0) return [];
 
   const cx = width / 2;
   const cy = height / 2;
 
-  // Build adjacency with cost
-  const costMap: Record<string, Record<string, number>> = {};
-  routers.forEach(r => {
-    costMap[r.id] = {};
-    r.neighbors.forEach(n => {
-      if (n.adjacentRouterId) {
-        costMap[r.id][n.adjacentRouterId] = n.cost ?? 10;
-      }
-    });
-  });
-
-  // Initialise positions on a circle
   const angleStep = (2 * Math.PI) / routers.length;
   const radius = Math.min(width, height) * 0.32;
   const positions: Record<string, { x: number; y: number }> = {};
@@ -75,9 +69,8 @@ function computeLayout(routers: Router[], width: number, height: number): NodePo
     };
   });
 
-  // Run force-directed iterations
   const ITERATIONS = 200;
-  const K = Math.sqrt((width * height) / routers.length) * 0.9; // spring length
+  const K = Math.sqrt((width * height) / routers.length) * 0.9;
   const REPULSION = K * K * 3.5;
   const ATTRACTION_DIVISOR = 120;
 
@@ -85,7 +78,6 @@ function computeLayout(routers: Router[], width: number, height: number): NodePo
     const disp: Record<string, { dx: number; dy: number }> = {};
     routers.forEach(r => { disp[r.id] = { dx: 0, dy: 0 }; });
 
-    // Repulsion between all pairs
     for (let a = 0; a < routers.length; a++) {
       for (let b = a + 1; b < routers.length; b++) {
         const ra = routers[a];
@@ -103,7 +95,6 @@ function computeLayout(routers: Router[], width: number, height: number): NodePo
       }
     }
 
-    // Attraction along edges (weighted by cost)
     routers.forEach(r => {
       r.neighbors.forEach(n => {
         const tid = n.adjacentRouterId;
@@ -112,7 +103,6 @@ function computeLayout(routers: Router[], width: number, height: number): NodePo
         const dx = positions[r.id].x - positions[tid].x;
         const dy = positions[r.id].y - positions[tid].y;
         const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-        // Higher cost = longer ideal distance
         const idealDist = Math.min(cost * ATTRACTION_DIVISOR, Math.min(width, height) * 0.55);
         const force = (dist - idealDist) * 0.04;
         const nx = (dx / dist) * force;
@@ -124,7 +114,6 @@ function computeLayout(routers: Router[], width: number, height: number): NodePo
       });
     });
 
-    // Cooling factor
     const temp = Math.max(5, 40 * (1 - iter / ITERATIONS));
 
     routers.forEach(r => {
@@ -133,7 +122,6 @@ function computeLayout(routers: Router[], width: number, height: number): NodePo
       const capped = Math.min(mag, temp);
       positions[r.id].x += (d.dx / mag) * capped;
       positions[r.id].y += (d.dy / mag) * capped;
-      // Clamp to canvas
       positions[r.id].x = Math.max(PADDING + NODE_W / 2, Math.min(width - PADDING - NODE_W / 2, positions[r.id].x));
       positions[r.id].y = Math.max(PADDING + NODE_H / 2, Math.min(height - PADDING - NODE_H / 2, positions[r.id].y));
     });
@@ -162,7 +150,15 @@ function buildEdges(routers: Router[]): Edge[] {
   return edges;
 }
 
-export default function TopologyDiagram({ routers }: Props) {
+const STATUS_OPTIONS: Router['status'][] = ['online', 'offline', 'degraded'];
+
+function statusVariantColor(status: Router['status']): string {
+  if (status === 'online') return '#34d399';
+  if (status === 'degraded') return '#fbbf24';
+  return '#f87171';
+}
+
+export default function TopologyDiagram({ routers, onUpdateRouter }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState({ width: 900, height: 600 });
   const [positions, setPositions] = useState<NodePos[]>([]);
@@ -174,8 +170,11 @@ export default function TopologyDiagram({ routers }: Props) {
   const [hoveredEdge, setHoveredEdge] = useState<string | null>(null);
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number; content: string } | null>(null);
+  const [inlineEdit, setInlineEdit] = useState<InlineEdit>(null);
+  const [editPopup, setEditPopup] = useState<{ routerId: string; x: number; y: number } | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const selectRef = useRef<HTMLSelectElement>(null);
 
-  // Measure container
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -187,17 +186,51 @@ export default function TopologyDiagram({ routers }: Props) {
     return () => obs.disconnect();
   }, []);
 
-  // Recompute layout
   useEffect(() => {
     setPositions(computeLayout(routers, dims.width, dims.height));
     setEdges(buildEdges(routers));
   }, [routers, dims]);
 
+  // Focus input/select when inline edit opens
+  useEffect(() => {
+    if (inlineEdit?.field === 'status') {
+      selectRef.current?.focus();
+    } else if (inlineEdit) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [inlineEdit]);
+
   const getPos = useCallback((id: string) => positions.find(p => p.id === id), [positions]);
 
-  // Pan handlers
+  const commitEdit = useCallback(() => {
+    if (!inlineEdit || !onUpdateRouter) { setInlineEdit(null); setEditPopup(null); return; }
+    const val = inlineEdit.value.trim();
+    if (val) {
+      onUpdateRouter(inlineEdit.routerId, { [inlineEdit.field]: val });
+    }
+    setInlineEdit(null);
+    setEditPopup(null);
+  }, [inlineEdit, onUpdateRouter]);
+
+  const cancelEdit = useCallback(() => {
+    setInlineEdit(null);
+    setEditPopup(null);
+  }, []);
+
+  const openEditPopup = (routerId: string, nodeScreenX: number, nodeScreenY: number) => {
+    setEditPopup({ routerId, x: nodeScreenX, y: nodeScreenY });
+    setTooltip(null);
+    setHoveredNode(null);
+  };
+
+  const startInlineEdit = (routerId: string, field: 'ipv4Address' | 'ipv6Address' | 'status', currentValue: string) => {
+    setInlineEdit({ routerId, field, value: currentValue });
+  };
+
   const onMouseDown = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('[data-node]')) return;
+    if (editPopup) { setEditPopup(null); setInlineEdit(null); return; }
     setDragging(true);
     setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
   };
@@ -214,6 +247,14 @@ export default function TopologyDiagram({ routers }: Props) {
 
   const resetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
 
+  // Convert SVG coords to screen coords for popup positioning
+  const svgToScreen = (svgX: number, svgY: number) => {
+    return {
+      x: svgX * zoom + pan.x,
+      y: svgY * zoom + pan.y,
+    };
+  };
+
   return (
     <div className={styles.wrapper}>
       <div className={styles.controls}>
@@ -227,6 +268,9 @@ export default function TopologyDiagram({ routers }: Props) {
         <button className={styles.ctrlBtn} onClick={resetView} title="Reset view">
           <Maximize2 size={16} />
         </button>
+        {onUpdateRouter && (
+          <span className={styles.editHint}>Click a node to edit IP / status</span>
+        )}
       </div>
 
       <div
@@ -280,7 +324,6 @@ export default function TopologyDiagram({ routers }: Props) {
               const color = getEdgeColor(edge.state);
               const dash = getEdgeDash(edge.state);
 
-              // Offset line endpoints to node border
               const dx = tgt.x - src.x;
               const dy = tgt.y - src.y;
               const dist = Math.sqrt(dx * dx + dy * dy) || 1;
@@ -307,14 +350,12 @@ export default function TopologyDiagram({ routers }: Props) {
                   }}
                   onMouseLeave={() => { setHoveredEdge(null); setTooltip(null); }}
                 >
-                  {/* Hit area */}
                   <line
                     x1={x1} y1={y1} x2={x2} y2={y2}
                     stroke="transparent"
                     strokeWidth={14}
                     style={{ cursor: 'pointer' }}
                   />
-                  {/* Visible line */}
                   <line
                     x1={x1} y1={y1} x2={x2} y2={y2}
                     stroke={color}
@@ -324,7 +365,6 @@ export default function TopologyDiagram({ routers }: Props) {
                     filter={isHovered ? 'url(#glow)' : undefined}
                     markerEnd={`url(#arrow-${edge.state})`}
                   />
-                  {/* Cost label */}
                   <rect
                     x={midX - 16} y={midY - 10}
                     width={32} height={18}
@@ -356,14 +396,16 @@ export default function TopologyDiagram({ routers }: Props) {
               const isHovered = hoveredNode === router.id;
               const x = pos.x - NODE_W / 2;
               const y = pos.y - NODE_H / 2;
+              const isEditTarget = editPopup?.routerId === router.id;
 
               return (
                 <g
                   key={router.id}
                   data-node
                   transform={`translate(${x},${y})`}
-                  style={{ cursor: 'pointer' }}
+                  style={{ cursor: onUpdateRouter ? 'pointer' : 'default' }}
                   onMouseEnter={e => {
+                    if (editPopup) return;
                     setHoveredNode(router.id);
                     const rect = containerRef.current?.getBoundingClientRect();
                     if (rect) setTooltip({
@@ -373,9 +415,14 @@ export default function TopologyDiagram({ routers }: Props) {
                     });
                   }}
                   onMouseLeave={() => { setHoveredNode(null); setTooltip(null); }}
+                  onClick={() => {
+                    if (!onUpdateRouter) return;
+                    const screen = svgToScreen(pos.x, pos.y);
+                    openEditPopup(router.id, screen.x, screen.y);
+                  }}
                 >
-                  {/* Node glow ring */}
-                  {isHovered && (
+                  {/* Glow ring when hovered or being edited */}
+                  {(isHovered || isEditTarget) && (
                     <rect
                       x={-4} y={-4}
                       width={NODE_W + 8} height={NODE_H + 8}
@@ -394,8 +441,8 @@ export default function TopologyDiagram({ routers }: Props) {
                     width={NODE_W} height={NODE_H}
                     rx={10}
                     fill="#1a1d27"
-                    stroke={statusColor}
-                    strokeWidth={isHovered ? 2 : 1.5}
+                    stroke={isEditTarget ? '#60a5fa' : statusColor}
+                    strokeWidth={isHovered || isEditTarget ? 2 : 1.5}
                   />
 
                   {/* Status bar */}
@@ -415,7 +462,7 @@ export default function TopologyDiagram({ routers }: Props) {
                     opacity={0.15}
                   />
 
-                  {/* Server icon (drawn as SVG path approximation) */}
+                  {/* Icon */}
                   <text
                     x={26} y={33}
                     textAnchor="middle"
@@ -427,7 +474,7 @@ export default function TopologyDiagram({ routers }: Props) {
 
                   {/* Router name */}
                   <text
-                    x={50} y={26}
+                    x={50} y={24}
                     fill="#e2e8f0"
                     fontSize={11}
                     fontWeight={700}
@@ -436,9 +483,9 @@ export default function TopologyDiagram({ routers }: Props) {
                     {router.name.length > 16 ? router.name.slice(0, 15) + '…' : router.name}
                   </text>
 
-                  {/* IP address */}
+                  {/* IPv4 */}
                   <text
-                    x={50} y={41}
+                    x={50} y={39}
                     fill="#8892a4"
                     fontSize={9.5}
                     fontFamily="var(--font-mono)"
@@ -446,15 +493,39 @@ export default function TopologyDiagram({ routers }: Props) {
                     {router.ipv4Address}
                   </text>
 
-                  {/* Neighbor count */}
+                  {/* IPv6 */}
                   <text
-                    x={50} y={56}
+                    x={50} y={53}
+                    fill="#6370a4"
+                    fontSize={9}
+                    fontFamily="var(--font-mono)"
+                  >
+                    {router.ipv6Address.length > 18 ? router.ipv6Address.slice(0, 17) + '…' : router.ipv6Address}
+                  </text>
+
+                  {/* Neighbor count + status badge */}
+                  <text
+                    x={50} y={68}
                     fill="#4a5070"
                     fontSize={9}
                     fontFamily="var(--font-sans)"
                   >
                     {router.neighbors.length} neighbor{router.neighbors.length !== 1 ? 's' : ''}
                   </text>
+
+                  {/* Edit hint */}
+                  {onUpdateRouter && isHovered && !isEditTarget && (
+                    <text
+                      x={NODE_W - 8} y={14}
+                      textAnchor="end"
+                      fill="#60a5fa"
+                      fontSize={8.5}
+                      fontFamily="var(--font-sans)"
+                      fontStyle="italic"
+                    >
+                      click to edit
+                    </text>
+                  )}
                 </g>
               );
             })}
@@ -462,7 +533,7 @@ export default function TopologyDiagram({ routers }: Props) {
         </svg>
 
         {/* Tooltip */}
-        {tooltip && (
+        {tooltip && !editPopup && (
           <div
             className={styles.tooltip}
             style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}
@@ -474,6 +545,126 @@ export default function TopologyDiagram({ routers }: Props) {
             ))}
           </div>
         )}
+
+        {/* Inline Edit Popup */}
+        {editPopup && onUpdateRouter && (() => {
+          const router = routers.find(r => r.id === editPopup.routerId);
+          if (!router) return null;
+          const statusColor = routerStatusColor(router.status);
+          // Position popup centered above the node
+          const popupW = 230;
+          const popupLeft = Math.min(
+            Math.max(editPopup.x - popupW / 2, 8),
+            dims.width - popupW - 8
+          );
+          const popupTop = Math.max(editPopup.y - NODE_H * zoom / 2 - 180, 8);
+
+          return (
+            <div
+              className={styles.editPopup}
+              style={{ left: popupLeft, top: popupTop, width: popupW }}
+              data-node
+              onClick={e => e.stopPropagation()}
+            >
+              <div className={styles.editPopupHeader}>
+                <span className={styles.editPopupTitle}>{router.name}</span>
+                <button className={styles.editPopupClose} onClick={cancelEdit}>✕</button>
+              </div>
+
+              {/* IPv4 */}
+              <div className={styles.editPopupField}>
+                <label className={styles.editPopupLabel}>IPv4 Address</label>
+                {inlineEdit?.routerId === router.id && inlineEdit.field === 'ipv4Address' ? (
+                  <div className={styles.editInputRow}>
+                    <input
+                      ref={inputRef}
+                      className={styles.editInput}
+                      value={inlineEdit.value}
+                      onChange={e => setInlineEdit(prev => prev ? { ...prev, value: e.target.value } : null)}
+                      onKeyDown={e => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') cancelEdit(); }}
+                      placeholder="e.g. 192.168.1.1"
+                    />
+                    <button className={styles.editSaveBtn} onClick={commitEdit}>✓</button>
+                    <button className={styles.editCancelBtn} onClick={() => setInlineEdit(null)}>✕</button>
+                  </div>
+                ) : (
+                  <div
+                    className={styles.editValueRow}
+                    onClick={() => startInlineEdit(router.id, 'ipv4Address', router.ipv4Address)}
+                    title="Click to edit"
+                  >
+                    <code className={styles.editValueCode}>{router.ipv4Address}</code>
+                    <span className={styles.editPencil}>✎</span>
+                  </div>
+                )}
+              </div>
+
+              {/* IPv6 */}
+              <div className={styles.editPopupField}>
+                <label className={styles.editPopupLabel}>IPv6 Address</label>
+                {inlineEdit?.routerId === router.id && inlineEdit.field === 'ipv6Address' ? (
+                  <div className={styles.editInputRow}>
+                    <input
+                      ref={inputRef}
+                      className={styles.editInput}
+                      value={inlineEdit.value}
+                      onChange={e => setInlineEdit(prev => prev ? { ...prev, value: e.target.value } : null)}
+                      onKeyDown={e => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') cancelEdit(); }}
+                      placeholder="e.g. fe80::1"
+                    />
+                    <button className={styles.editSaveBtn} onClick={commitEdit}>✓</button>
+                    <button className={styles.editCancelBtn} onClick={() => setInlineEdit(null)}>✕</button>
+                  </div>
+                ) : (
+                  <div
+                    className={styles.editValueRow}
+                    onClick={() => startInlineEdit(router.id, 'ipv6Address', router.ipv6Address)}
+                    title="Click to edit"
+                  >
+                    <code className={styles.editValueCode}>{router.ipv6Address}</code>
+                    <span className={styles.editPencil}>✎</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Status */}
+              <div className={styles.editPopupField}>
+                <label className={styles.editPopupLabel}>Status</label>
+                {inlineEdit?.routerId === router.id && inlineEdit.field === 'status' ? (
+                  <div className={styles.editInputRow}>
+                    <select
+                      ref={selectRef}
+                      className={styles.editSelect}
+                      value={inlineEdit.value}
+                      onChange={e => setInlineEdit(prev => prev ? { ...prev, value: e.target.value } : null)}
+                      onKeyDown={e => { if (e.key === 'Escape') cancelEdit(); }}
+                    >
+                      {STATUS_OPTIONS.map(s => (
+                        <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>
+                      ))}
+                    </select>
+                    <button className={styles.editSaveBtn} onClick={commitEdit}>✓</button>
+                    <button className={styles.editCancelBtn} onClick={() => setInlineEdit(null)}>✕</button>
+                  </div>
+                ) : (
+                  <div
+                    className={styles.editValueRow}
+                    onClick={() => startInlineEdit(router.id, 'status', router.status)}
+                    title="Click to edit"
+                  >
+                    <span className={styles.editStatusDot} style={{ background: statusColor }} />
+                    <span className={styles.editStatusText} style={{ color: statusColor }}>
+                      {router.status.charAt(0).toUpperCase() + router.status.slice(1)}
+                    </span>
+                    <span className={styles.editPencil}>✎</span>
+                  </div>
+                )}
+              </div>
+
+              <button className={styles.editPopupDone} onClick={cancelEdit}>Done</button>
+            </div>
+          );
+        })()}
       </div>
 
       {routers.length === 0 && (

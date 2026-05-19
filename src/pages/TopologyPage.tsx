@@ -1,40 +1,23 @@
-import { useRouters } from '@/hooks/useRouters';
 import TopologyDiagram from '@/components/topology/TopologyDiagram';
+import { useRouters } from '@/hooks/useRouters';
 import styles from '@/pages/TopologyPage.module.css';
-import { Share2 } from 'lucide-react';
 
 export default function TopologyPage() {
-  const { routers } = useRouters();
+  const { routers, updateRouter } = useRouters();
 
   return (
     <div className={styles.page}>
-      <div className={styles.header}>
+      <div className={styles.pageHeader}>
         <div>
-          <h1 className={styles.title}>Network Topology</h1>
-          <p className={styles.subtitle}>
-            Routers positioned by NDP adjacency cost — lines show direct neighbor links
+          <h1 className={styles.pageTitle}>Network Topology</h1>
+          <p className={styles.pageSubtitle}>
+            Force-directed diagram arranged by NDP neighbor cost. Click a router node to edit its IP addresses or status.
           </p>
         </div>
-        <div className={styles.legend}>
-          <div className={styles.legendItem}>
-            <span className={styles.legendDot} style={{ background: 'var(--color-success)' }} />
-            Online
-          </div>
-          <div className={styles.legendItem}>
-            <span className={styles.legendDot} style={{ background: 'var(--color-warning)' }} />
-            Degraded
-          </div>
-          <div className={styles.legendItem}>
-            <span className={styles.legendDot} style={{ background: 'var(--color-danger)' }} />
-            Offline
-          </div>
-          <div className={styles.legendItem}>
-            <Share2 size={13} style={{ color: 'var(--color-text-muted)' }} />
-            NDP adjacency
-          </div>
-        </div>
       </div>
-      <TopologyDiagram routers={routers} />
+      <div className={styles.diagramWrap}>
+        <TopologyDiagram routers={routers} onUpdateRouter={updateRouter} />
+      </div>
     </div>
   );
 }
