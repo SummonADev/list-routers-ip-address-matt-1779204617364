@@ -8,6 +8,8 @@ export type Neighbor = {
   interface: string;
   state: NDPState;
   lastSeen: string;
+  cost?: number;
+  adjacentRouterId?: string;
 };
 
 export type Router = {
